@@ -124,6 +124,11 @@ local mixins = remove_nulls([
     (import 'github.com/grafana/jsonnet-libs/opensearch-mixin/mixin.libsonnet'),
     vars,
   ),
+  addMixin(
+    'cilium-enterprise',
+    (import 'github.com/grafana/jsonnet-libs/cilium-enterprise-mixin/mixin.libsonnet'),
+    vars,
+  ),
   (
     if std.objectHas(vars, 'kube_prometheus_version') && vars.kube_prometheus_version == 'v0.13.0' then (
       addMixin(
@@ -221,6 +226,23 @@ local dropExcludedAlerts(groups) =
       for group in groups
     ]
   );
+
+// KubeJobFailed skips Velero's repo maintenance jobs (<repo>-maintain-job-<millis>).
+// Velero retries a failed one a few minutes later by itself, but the failed Job is
+// kept with the last few jobs, so a single slow bucket response kept KubeJobFailed
+// firing for hours. kubeaid-backup-exporter's VeleroRepoMaintenanceFailing alerts
+// when a repo really keeps failing. https://github.com/velero-io/velero/issues/9225
+local skipVeleroMaintenanceJobs(groups) = [
+  group {
+    rules: [
+      if std.objectHas(rule, 'alert') && rule.alert == 'KubeJobFailed' then
+        rule { expr: std.strReplace(rule.expr, 'kube_job_failed{', 'kube_job_failed{job_name!~".+-maintain-job-[0-9]+",') }
+      else rule
+      for rule in group.rules
+    ],
+  }
+  for group in groups
+];
 
 local kpBase =
   (import 'kube-prometheus/main.libsonnet') +
@@ -619,7 +641,7 @@ local kpBase =
         plugins: vars.grafana_plugins,
         resources: vars.grafana_resources,
         dashboards+: {
-          [dashboard]: mixin.grafanaDashboards[dashboard]
+          [std.asciiLower(dashboard)]: mixin.grafanaDashboards[dashboard]
           for mixin in mixins
           if mixin.grafanaDashboards != null
           for dashboard in std.objectFields(mixin.grafanaDashboards)
@@ -938,11 +960,24 @@ local kpBase =
     [if std.objectHas(vars, 'grafana_probe_target') then 'grafana']+: blackboxIngressRule('grafana'),
     [if std.objectHas(vars, 'prometheus_probe_target') then 'prometheus']+: blackboxIngressRule('prometheus'),
     [if std.objectHas(vars, 'alertmanager_probe_target') then 'alertmanager']+: blackboxIngressRule('alertmanager'),
-  };
+  } +
+  // scrape_scheduler_and_controller_manager: false applies kube-prometheus' managed-cluster
+  // addon, which drops both ServiceMonitors and their alert groups. It has to come after the
+  // kubeadm ServiceMonitor patch above. The kubeadm discovery Services go too: nothing
+  // selects them any more.
+  (
+    if vars.scrape_scheduler_and_controller_manager then {} else
+      (import 'kube-prometheus/addons/managed-cluster.libsonnet') + {
+        kubernetesControlPlane+: {
+          kubeSchedulerPrometheusDiscoveryService:: null,
+          kubeControllerManagerPrometheusDiscoveryService:: null,
+        },
+      }
+  );
 
 // excluded_alerts applies to the alert rules of every component that has any.
 local kp = kpBase {
-  [component]+: { prometheusRule+: { spec+: { groups: dropExcludedAlerts(super.groups) } } }
+  [component]+: { prometheusRule+: { spec+: { groups: skipVeleroMaintenanceJobs(dropExcludedAlerts(super.groups)) } } }
   for component in std.objectFields(kpBase)
   if std.isObject(kpBase[component]) && std.objectHasAll(kpBase[component], 'prometheusRule')
 };

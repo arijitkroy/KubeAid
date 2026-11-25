@@ -26,10 +26,11 @@ See `lib/default_vars.libsonnet` for the full list of defaults.
 
 ## Skipping alerts per cluster
 
-Two settings in the cluster vars file:
+Three settings in the cluster vars file:
 
 - `alert_namespace_selector` adds a PromQL matcher to the kubernetes-mixin's app, resource and storage alerts (pod, deployment, job, quota and volume alerts). The default `null` alerts on every namespace.
 - `excluded_alerts` drops the named alerts from every rule the build renders, kube-prometheus and mixins alike. The default `[]` keeps them all.
+- `scrape_scheduler_and_controller_manager` decides whether kube-scheduler and kube-controller-manager are scraped. The default `false` skips both and drops their alerts (`KubeSchedulerDown`, `KubeControllerManagerDown`, and from v0.18.0 the two `…InstanceUnreachable` alerts), because kubeadm binds both to 127.0.0.1, where Prometheus can't reach them. Set it to `true` only where both listen on an address Prometheus can reach.
 
 ```jsonnet
 alert_namespace_selector: 'namespace!~"dev-.*"',
@@ -106,18 +107,33 @@ Or delete the version directory and re-run `setup-version.sh`.
 
 ### Validating rules
 
-Generate and check the rule file:
+`mixin.libsonnet` is the source: it is what `build.sh` compiles into a cluster's rules.
+`prometheus.yaml` is a generated copy that promtool can read, so never edit it by hand.
+Regenerate it after every change to `mixin.libsonnet`, from the mixin's folder:
 
 ```sh
 jsonnet -e '(import "mixin.libsonnet").prometheusAlerts' | gojsontoyaml > prometheus.yaml
-promtool check rules prometheus.yaml
 ```
 
-Run unit tests if you have a test file:
+Unit tests go next to it, with `rule_files: [prometheus.yaml]`, in a file named:
+
+- `<alert>_test.yaml` when it tests one alert, the alert name in snake case
+  (`kube_hpa_maxed_out_test.yaml` for `KubeHpaMaxedOut`)
+- `tests.yaml` when it tests several alerts
+
+No other `.yaml` file is allowed in a mixin folder; CI fails on any other name, so a
+test file cannot be skipped because of how it is called.
+
+Then check the rules and run the tests:
 
 ```sh
-promtool test rules build/kube-prometheus/mixins/<mixin-name>/test.yaml
+promtool check rules prometheus.yaml
+promtool test rules tests.yaml
 ```
+
+CI (`.github/workflows/promtool.yml`) runs these for every mixin, fails when
+`prometheus.yaml` differs from what `mixin.libsonnet` generates, and runs
+`mixtool lint --prometheus --grafana=false mixin.libsonnet`.
 
 ### Testing on a cluster
 

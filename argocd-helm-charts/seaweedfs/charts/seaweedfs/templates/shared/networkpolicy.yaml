@@ -110,6 +110,18 @@
 {{-   $targets = append $targets (dict "component" "worker" "ports" $ports) }}
 {{- end }}
 
+{{- if .Values.vector.enabled }}
+{{-   $ports := list .Values.vector.port }}
+{{-   if .Values.vector.metricsPort }}
+{{-     $ports = append $ports .Values.vector.metricsPort }}
+{{-   end }}
+{{-   $targets = append $targets (dict "component" "vector" "ports" $ports) }}
+{{- end }}
+
+{{- if and .Values.vector.enabled .Values.vector.createBuckets }}
+{{-   $targets = append $targets (dict "component" "vector-bucket-hook" "ports" (list)) }}
+{{- end }}
+
 {{- if .Values.cosi.enabled }}
 {{- /* The provisioner sidecar watches the COSI CRs, so it needs the API
        server; nothing needs to reach the driver itself. */}}
@@ -143,7 +155,7 @@
        every component the chart can produce rather than the ones enabled here,
        so one values file can still carry overrides for a component this release
        leaves off. */}}
-{{- $known := list "master" "filer" "s3" "sftp" "admin" "worker" "volume" "bucket-hook" "volume-resize-hook" "objectstorage-provisioner" "seaweedfs-all-in-one" }}
+{{- $known := list "vector" "vector-bucket-hook" "master" "filer" "s3" "sftp" "admin" "worker" "volume" "bucket-hook" "volume-resize-hook" "objectstorage-provisioner" "seaweedfs-all-in-one" }}
 {{- range $vname, $_ := (.Values.volumes | default dict) }}
 {{-   $known = append $known (trimSuffix "-" (printf "volume-%s" $vname)) }}
 {{- end }}
@@ -161,13 +173,14 @@ apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: {{ include "seaweedfs.componentName" (list $ ($target.name | default $component)) }}
-  namespace: {{ $.Release.Namespace }}
+  namespace: {{ include "seaweedfs.namespace" $ | quote }}
   labels:
     app.kubernetes.io/name: {{ include "seaweedfs.name" $ | quote }}
     helm.sh/chart: {{ $.Chart.Name }}-{{ $.Chart.Version | replace "+" "_" }}
     app.kubernetes.io/managed-by: {{ $.Release.Service | quote }}
     app.kubernetes.io/instance: {{ $.Release.Name | quote }}
     app.kubernetes.io/component: {{ $component | quote }}
+    {{- with include "seaweedfs.commonLabels" $ }}{{ . | nindent 4 }}{{ end }}
 {{- if $target.hook }}
   annotations:
     {{- /* Only before-hook-creation: the policy has to outlive the Job it

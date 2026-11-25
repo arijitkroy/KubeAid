@@ -56,6 +56,9 @@ spec:
   {{- end }}
   serviceAccount: {{ include "openobserve-collector.serviceAccountName" . }}
   image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+  {{- with .Values.image.pullPolicy }}
+  imagePullPolicy: {{ . }}
+  {{- end }}
   {{- with .Values.image.imagePullSecrets }}
   imagePullSecrets:
     {{- toYaml . | nindent 4 }}
@@ -63,6 +66,10 @@ spec:
   securityContext:
     privileged: true
     runAsUser: 0
+  {{- with .Values.ebpf.extraEnv }}
+  env:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   {{- with .Values.ebpf.tolerations }}
   tolerations:
     {{- toYaml . | nindent 4 }}

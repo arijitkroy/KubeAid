@@ -23,7 +23,7 @@ helm install --values=values.yaml seaweedfs seaweedfs/seaweedfs
 * master/filer/volume are stateful sets with anti-affinity on the hostname,
 so your deployment will be spread/HA.
 * leveldb2 is the default filer backend; a mysql-compatible database (memsql, ...) enables HA (multiple filer instances) and the backup/HA it can provide.
-* with `filer.extraEnvironmentVars.WEED_MYSQL_ENABLED` set to `"true"`, mysql user/password are created in a k8s secret (default: `<release>-seaweedfs-db-secret`) and injected to the filer with ENV. On any other store neither the secret nor the `WEED_MYSQL_*` env, plain or secret-backed, is rendered.
+* with `filer.extraEnvironmentVars.WEED_MYSQL_ENABLED` set to `"true"`, mysql user/password are created in a k8s secret (default: `<release>-seaweedfs-db-secret`) and injected to the filer with ENV. The secret is kept on `helm uninstall`, and a later install reuses the user and password in it, including ones you edited in. On any other store neither the secret nor the `WEED_MYSQL_*` env, plain or secret-backed, is rendered.
 * cert config exists and can be enabled, but not been tested, requires cert-manager to be installed.
 
 ## Prerequisites
@@ -545,6 +545,10 @@ helm install seaweedfs-worker-vacuum seaweedfs/seaweedfs -f values-worker-vacuum
 helm install seaweedfs-worker-balance seaweedfs/seaweedfs -f values-worker-balance.yaml
 ```
 
+## Deploying into another namespace
+
+`namespaceOverride` deploys every namespaced object into an existing namespace other than the release namespace, for instance when the chart is a subchart. In-cluster addresses follow it. Set it before the first install: changing it later moves regular namespaced objects only — claims and their data do not move, hook resources such as the resize hook's ServiceAccount, Role, RoleBinding, and NetworkPolicy stay behind in the old namespace, and generated Secrets are not recreated in the new one. Migrate claims by hand and clean up the old hook resources. If the release uses generated S3 credentials, copy `<fullname>-s3-secret`, including its key fields, into the new namespace before the upgrade — otherwise the chart generates new keys and clients on the old ones fail authentication (explicit `s3.credentials` and `credentials.*.existingSecret` values do not use this generation path). With the default MySQL setup, also copy `<fullname>-db-secret` — a `pre-install` hook only, so it never reaches the new namespace — or pass `WEED_MYSQL_USERNAME` and `WEED_MYSQL_PASSWORD` through `filer.extraEnvironmentVars`. With the default `hostPath` storage the data is node-local too: stop the old workloads and plan the hostPath migration first, or the new pods can come up empty on other nodes or share the same directories concurrently.
+
 ## Gateway API
 
 Every component with an `ingress` block (master, volume, filer, s3 and admin) can also be exposed through a [Gateway API](https://gateway-api.sigs.k8s.io/) `HTTPRoute`, for clusters that route through a Gateway instead of an Ingress controller. `<component>.httpRoute` sits next to `<component>.ingress` and is disabled by default. The chart does not create the Gateway, so point `parentRefs` at one that already exists, and the `gateway.networking.k8s.io/v1` CRDs must be installed.
@@ -605,6 +609,10 @@ Two things worth knowing before you turn this on:
 - **The resize hook's policy is a Helm hook.** Its Job runs before the release manifest is applied, so the policy has to be a `pre-install` hook too. Helm does not garbage-collect hook resources, so on an upgrade that grows a volume PVC the policy is created and then left behind on uninstall - delete `<release>-seaweedfs-volume-resize-hook` by hand if it bothers you.
 
 The DNS selectors default to CoreDNS as kubeadm, kind and the managed offerings from AWS, Google and Azure install it. On OpenShift, override `egress.dnsNamespaceSelector` and `egress.dnsPodSelector` to match `openshift-dns`; see the comment in `values.yaml`.
+
+## Common labels
+
+`commonLabels` adds labels to the metadata of every object the chart creates. It may be a map or a template string rendering to one. The chart's own labels cannot be overridden, and pods (see `podLabels`) and `volumeClaimTemplates` are left unchanged.
 
 ## Pod and container security contexts
 
@@ -679,3 +687,47 @@ generates a new UUID and the license stops matching. See
 [Master data](#master-data-hostpath-vs-a-claim). Check the binding with
 `kubectl exec <master-pod> -- curl -s localhost:9333/license/status`
 (`cluster_uuid` must equal `license_uuid`).
+
+
+## Vector buckets
+
+The S3 gateway serves the S3 Vectors API on its existing endpoint. Enable a vector engine and Lance maintenance worker alongside the cluster:
+
+```yaml
+s3:
+  enabled: true
+vector:
+  enabled: true
+  replicas: 1
+worker:
+  enabled: true
+admin:
+  enabled: true
+  secret:
+    adminPassword: change-me
+global:
+  seaweedfs:
+    securityConfig:
+      jwtSigning:
+        filerWrite: true
+```
+
+The engine registers its pod address with the masters and stores indexes through the filers and volume servers. Both Go and Rust volume servers use the same setup. The maintenance worker builds and updates ANN indexes; queries can scan data before indexing completes. Enabling filer write signing also requires clients writing directly to the filer HTTP API to supply a signed JWT.
+
+The bundled engine images support Linux amd64 and arm64. Use `vector.imageOverride` to select a compatible engine build, `vector.masters` for an external cluster, and `vector.resources` to set memory and CPU limits. The cache defaults to 512 MiB and is configured with `vector.readCacheMB`.
+
+`global.seaweedfs.enableSecurity` provisions and mounts the vector certificate and shared security configuration. With external certificates, provide the `<fullname>-vector-cert` secret (`my-seaweedfs-vector-cert` for release `my`). `fullname` follows `seaweedfs.fullname`, including `fullnameOverride`, `nameOverride`, and DNS-name truncation. Provide this secret alongside the existing CA and client secrets.
+
+The default `vector.metricsPort: 0` and TCP probes support existing engine images. The default 4.53 image does not accept metrics flags; enabling metrics with it is rejected at render time. For engine builds with `/metrics`, `/health`, and `/ready`, set `vector.imageOverride` to that compatible image and `vector.metricsPort: 9329`; readiness then checks master registration. Enabling `global.seaweedfs.monitoring.enabled` also creates the vector ServiceMonitor. NetworkPolicy includes the configured gRPC and metrics ports.
+
+
+To provision vector buckets during installation and upgrades, set:
+
+```yaml
+vector:
+  enabled: true
+  createBuckets:
+    - embeddings
+```
+
+The hook uses the AWS CLI's S3 Vectors API and works with existing SeaweedFS vector releases. It creates missing buckets, preserves existing vector buckets, and fails if the name belongs to an Iceberg bucket. It uses the chart's generated S3 admin credentials, including `s3.credentials.admin.existingSecret`. With a custom `s3.existingConfigSecret` or an external endpoint, set `vector.bucketHook.credentialsSecret` to a Secret containing `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (and optionally `AWS_SESSION_TOKEN`). Key names are configurable. `vector.bucketHook.endpoint` overrides the internal S3 service URL; `caBundleSecret` and `caBundleKey` configure a private HTTPS CA. The hook image and resource limits are configurable under `vector.bucketHook`. For restricted Pod Security, select a non-root-compatible image and configure `vector.bucketHook.podSecurityContext` and `containerSecurityContext`, including `runAsNonRoot` and the image user ID.

@@ -17,8 +17,51 @@ removal has to be repeated on every chart bump.
 
 - `cloudnative-pg` and `redis-operator` installed on the cluster.
 - `sealed-secrets` (or another out-of-band secret mechanism) for the two Secrets below.
-- An S3-compatible bucket plus its access key and secret key. The chart does **not** provision one —
-  request the bucket and credentials, then set `buzz.s3.endpoint` and `buzz.s3.bucket`.
+- An owner Nostr keypair when relay membership is enabled — see [Relay membership](#relay-membership).
+- An S3-compatible bucket plus a **dedicated** access key scoped to it — see
+  [Credentials](#credentials). The chart does **not** provision either.
+
+## Installation
+
+In order; each step links to the details below.
+
+1. Generate the owner keypair and keep the secret in your password store —
+   [Relay membership](#relay-membership).
+2. Create the bucket and a dedicated access key limited to it — [Credentials](#credentials).
+3. Seal `buzz-pgsql-credentials` and `buzz-secrets` (including the S3 keys) into your
+   `kubeaid-config` repo — [Secrets](#secrets).
+4. In the cluster's values file, set at least:
+
+   ```yaml
+   buzz:
+     relayUrl: wss://buzz.example.com
+     ownerPubkey: <64-char hex public key>
+     relay:
+       requireRelayMembership: true
+     s3:
+       endpoint: https://s3.example.com
+       bucket: buzz-media
+     ingress:
+       className: <your ingress class>
+       annotations: {}      # cert-manager / external-dns, per cluster
+       tls:
+         - hosts: [buzz.example.com]
+           secretName: buzz-tls
+   ```
+
+5. Sync. The relay log should show, in order, `Postgres connected`, `Database migrations complete`,
+   `Relay owner bootstrapped`, `Redis pub/sub connected`, `Media storage connected`, and the
+   conformance probe passing. A `CrashLoopBackOff` after `Media storage connected` is object
+   storage — see [Object storage](#object-storage).
+6. Check the relay answers:
+
+   ```sh
+   curl -H 'Accept: application/nostr+json' https://buzz.example.com
+   ```
+
+   It returns the relay's NIP-11 document (`"software": "https://github.com/block/buzz"`, its
+   `version`, `"auth_required": true`).
+7. Sign in to a Buzz app as the owner and admit everyone else — [Connecting clients](#connecting-clients).
 
 ## Secrets
 
@@ -90,13 +133,61 @@ The relay runs an S3 conformance probe at startup and **exits** if the bucket is
 credentials are wrong, so readiness never opens. A relay stuck in `CrashLoopBackOff` on a fresh
 install is almost always the bucket, not the database.
 
-Chart 0.1.7 always addresses objects as `<endpoint>/<bucket>/<key>`; it has no region or
-addressing-style setting, so the endpoint has to serve path-style requests. Upstream's `main` adds
-`s3.region` and `s3.addressingStyle`, but the published 0.1.7 artifact rejects both — its
-`values.schema.json` sets `additionalProperties: false` — so they cannot be set until this wrapper
-tracks a newer chart version.
+`buzz.s3.addressingStyle` picks how objects are addressed: `path` (the default,
+`<endpoint>/<bucket>/<key>`) for MinIO, RustFS and other endpoints that do not resolve bucket
+subdomains, or `virtual` (`<bucket>.<endpoint>/<key>`) for AWS-style providers. `buzz.s3.region` is
+the SigV4 signing region and defaults to `us-east-1`; set it when the provider's credential region
+differs.
 
 The bucket must not be folded into `buzz.s3.endpoint`; the two are passed separately.
+
+### Credentials
+
+Give the relay its own access key, limited to its bucket. Do not reuse a key that another workload
+already holds — a backup tool's key, for example: the relay would then be able to delete those
+backups, and that key usually has no rights on the new bucket anyway.
+
+The key needs:
+
+| Action | Resource | Used for |
+|---|---|---|
+| `s3:ListBucket`, `s3:GetBucketLocation` | `arn:aws:s3:::<bucket>` | listing, startup probe |
+| `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject` | `arn:aws:s3:::<bucket>/*` | media and git objects |
+| `s3:ListBucketVersions`, `s3:DeleteObjectVersion` | bucket / `<bucket>/*` | community deletion |
+
+A key without access fails the startup conformance probe with
+`git conformance probe failed: s3 backend error: Got HTTP 403 … AccessDenied`, right after
+`Media storage connected`. That is a permissions problem, not a missing S3 feature. Check the key
+outside the cluster before sealing it:
+
+```sh
+AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=… \
+  aws --endpoint-url https://s3.example.com s3api head-bucket --bucket buzz-media
+```
+
+Buzz has no key-prefix setting: it writes to the bucket root (`_meta/`, `repos/`, `packs/`, media
+blobs, …), so it needs a bucket of its own rather than a folder in a shared one.
+
+### Slow object storage
+
+Uploads stream through the relay to the bucket, and the relay's S3 client has a fixed request
+timeout. On a slow backend (HDD-backed MinIO or RustFS, for example) lower the concurrency and the
+largest upload so requests finish in time:
+
+```yaml
+buzz:
+  relay:
+    extraEnv:
+      - name: BUZZ_MEDIA_MAX_CONCURRENT_UPLOADS              # default 8
+        value: "4"
+      - name: BUZZ_MEDIA_MAX_CONCURRENT_UPLOADS_PER_PUBKEY   # default 2
+        value: "1"
+      - name: BUZZ_MAX_VIDEO_BYTES                           # default 500 MiB
+        value: "104857600"
+```
+
+`BUZZ_MAX_FILE_BYTES` (default 100 MiB) caps other files. Remove the overrides once the backend is
+fast enough.
 
 ### Conformance probe (A3 gate)
 
@@ -147,8 +238,73 @@ Traefik proxies WebSockets without extra configuration.
 ## Relay membership
 
 `buzz.relay.requireRelayMembership` is `false` here, which runs an open relay and needs no operator
-identity. To gate access on relay membership, set it to `true` and set `buzz.ownerPubkey` to the
-operator's 64-char lowercase hex Nostr pubkey; the chart refuses to render without it.
+identity: any Nostr key that completes NIP-42 auth can connect and create channels. A relay reachable
+from the internet should set it to `true`, and then `buzz.ownerPubkey` must be set before the first
+sync — the chart refuses to render without it.
+
+The owner is the relay's first member and the one who admits everyone else, so the key has to exist
+before anyone can join. It is an ordinary Nostr keypair (secp256k1, the same kind every Buzz app
+creates for its user); WireGuard or SSH keys are a different kind and do not work. Generate one
+offline with the relay image itself:
+
+```sh
+docker run --rm --network none --entrypoint buzz-admin ghcr.io/block/buzz:0.3.0 generate-key
+```
+
+```text
+Public key:  <64 hex>    → buzz.ownerPubkey (public, safe to commit)
+Secret key:  <64 hex>    → the operator's password store; never commit it
+```
+
+Alternatively, create the identity in the Buzz mobile app and convert its `npub1…` to hex with
+`nak decode`.
+
+`npub1…` and `nsec1…` are not hashes: they are the same 32-byte keys as the hex above, written in
+NIP-19 bech32 form with a checksum. The Buzz apps import the secret only as `nsec1…`, so convert the
+hex secret once, offline, and keep both forms in the password store:
+
+```sh
+nak encode nsec <64-char hex secret>
+```
+
+Only this key is created by hand. Every other user's app generates its own keypair on first launch,
+and the owner admits them through the app's membership flow or with
+`buzz-admin add-member <pubkey>` in the relay pod.
+
+## Connecting clients
+
+Use the Buzz desktop app ([block/buzz-app](https://github.com/block/buzz-app) releases) or the Buzz
+mobile app. Opening `https://buzz.example.com/` in a browser shows the relay's NIP-11 JSON document;
+that is expected. The relay serves no chat UI, and buzz-app's web build is a development tool that
+signs through a local helper, so there is no hosted web client to deploy.
+
+First launch of the desktop app, signing in as the owner:
+
+1. On **Join or create a community**, choose **I already have a community**. **Create a
+   community** is for communities that Block's Builderlab hosts and asks for a Builderlab account.
+
+   <img src="static/1-join-or-create.png" alt="Join or create a community: choose I already have a community" width="560" height="602">
+
+2. Choose **I'm a member or admin**. **I own the community** is again the Builderlab-hosted path,
+   even for the relay's owner.
+
+   <img src="static/2-reconnect-role.png" alt="Reconnect to your community: choose I'm a member or admin" width="560" height="484">
+
+3. Enter `wss://buzz.example.com`.
+
+   <img src="static/3-community-url.png" alt="Reconnect to your community: enter the relay's wss:// URL" width="560" height="391">
+
+4. The app creates a key of its own during setup, so a members-only relay answers
+   **Not a member yet** and shows that key's npub. That is the relay working: the key is unknown.
+   Choose **Use a different key**, paste the owner's `nsec1…`, check that the npub shown is now the
+   owner's, and choose **Try again**.
+
+   <img src="static/4-not-a-member.png" alt="Not a member yet: choose Use a different key and paste the owner's nsec" width="560" height="609">
+
+Everyone else joins with **Join a community** and an invite link, or sends the owner the npub their
+app shows on **Not a member yet** to be added.
+
+## Scaling
 
 ## Scaling
 
@@ -158,8 +314,11 @@ at any replica count — no ReadWriteMany storage is needed.
 
 ## Relay image
 
-`image.tag` is pinned instead of inheriting `.Chart.AppVersion`. Chart 0.1.7 still declares
-`appVersion: 0.1.0`, and that relay predates the startup migration step: it never creates the schema,
+`image.tag` is pinned to `0.3.0`, the vendored chart's `appVersion`, rather than inherited from it, so
+a chart bump never moves the relay by itself. `0.3.0` is also the first relay with NIP-FI, the
+federated-identity layer that OIDC single sign-on is built on; `0.2.0` predates it.
+
+Relays before `0.2.0` predate the startup migration step: they never create the schema,
 `_sqlx_migrations` is never written, and the relay then serves traffic while every query fails on a
 missing relation — it looks healthy and answers WebSockets, so the cause is not obvious.
 
@@ -167,7 +326,8 @@ A relay that runs migrations logs either `Database migrations complete` or `Skip
 migrations because BUZZ_AUTO_MIGRATE is not enabled` right after `Postgres connected`. Neither line
 means the image is too old, whatever `BUZZ_AUTO_MIGRATE` is set to.
 
-Re-check the pin when bumping the chart — upstream may have realigned `appVersion` by then.
+Re-check the pin when bumping the chart, and read upstream's upgrade notes first: some relay
+releases require every pod to run a specific stop build before their migrations run.
 
 Verify any new tag actually exists before pinning it. GHCR's `tags/list` for this repository returns
 incomplete and inconsistent pages, and upstream's GitHub releases run ahead of the published relay
@@ -178,7 +338,8 @@ instead:
 crane manifest ghcr.io/block/buzz:<tag> >/dev/null && echo exists
 ```
 
-`0.2.0` is the newest published release image; it shares a digest with `latest`.
+Relay release tags are `relay-v<version>` in git and `<version>` on GHCR; the `v0.5.x` and
+`desktop-v*` tags are desktop app releases with no relay image behind them.
 
 ## Init containers
 

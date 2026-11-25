@@ -35,6 +35,9 @@ spec:
   {{- end }}
   serviceAccount: {{ include "openobserve-collector.serviceAccountName" . }}
   image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+  {{- with .Values.image.pullPolicy }}
+  imagePullPolicy: {{ . }}
+  {{- end }}
   {{- with .Values.image.imagePullSecrets }}
   imagePullSecrets:
     {{- toYaml . | nindent 4 }}
@@ -52,6 +55,9 @@ spec:
       valueFrom:
         fieldRef:
           fieldPath: status.hostIP
+  {{- with .Values.gateway.extraEnv }}
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   {{- with .Values.gateway.tolerations }}
   tolerations:
     {{- toYaml . | nindent 4 }}

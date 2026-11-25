@@ -1,0 +1,50 @@
+providers:
+  azure:
+    enabled: false
+    credentials:
+      secretName: azure-credentials
+      secretKey: credentials
+
+  scaleway:
+    enabled: false
+    provider:
+      # v0.6.0 is published for amd64 only and crashloops with "exec format error" on arm64 nodes;
+      # v0.8.0 ships both amd64 and arm64 images.
+      version: v0.8.0
+    credentials:
+      secretName: scaleway-credentials
+      secretKey: credentials
+
+  keycloak:
+    enabled: false
+    provider:
+      version: v2.18.0
+    credentials:
+      secretName: keycloak-credentials
+      secretKey: credentials
+
+  opentofu:
+    enabled: false
+    provider:
+      version: v1.1.7
+
+azure:
+  workloadIdentityInfrastructure:
+    enabled: false
+  disasterRecoveryInfrastructure:
+    enabled: false
+
+keycloak:
+  obmondoKeycloakGroupsPropagation:
+    enabled: false
+
+  argocdClient:
+    enabled: false
+  grafanaClient:
+    enabled: false
+  openobserveClient:
+    enabled: false
+
+netbird:
+  keycloakIntegration:
+    enabled: false
